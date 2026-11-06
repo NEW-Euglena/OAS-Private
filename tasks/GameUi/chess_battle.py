@@ -42,6 +42,17 @@ class ChessBattleNavigationMixin:
             self.screenshot()
         raise GameStuckError('[棋局] 六道选择: 选定场地后选择界面仍未消失')
 
+    def _close_unknown_chess_result_page(self) -> bool:
+        """尝试关闭棋局结算途中的未知页面，交给下一帧重新判断。"""
+        if self.chess_result_flow_visible() or self.appear(ChessAssets.I_RESTART_AGAIN):
+            return False
+        if not self.appear(ChessAssets.I_BACK_RED):
+            return False
+        logger.warning('[棋局] 结算流程: 关闭带红色返回按钮的未知页面')
+        self._chess_share_advancing = False
+        self.click(ChessAssets.I_BACK_RED, interval=0.8)
+        return True
+
     def _advance_chess_result_stage(self) -> bool:
         """优先处理奖励和分享阶段，避免背景被识别成大厅。"""
         if self.appear(GlobalGameAssets.I_UI_REWARD):
