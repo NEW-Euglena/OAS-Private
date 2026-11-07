@@ -67,6 +67,10 @@ class ScriptTask(BaseTask):
             self.app_start()
 
     def recover_app(self):
+        # 桌面客户端不使用 ADB 生命周期判断，窗口复用和强制重启由桌面配置决定。
+        if self.device.is_desktop:
+            self.app_restart()
+            return
         if not self.device.app_is_alive():
             logger.info('[重启] 恢复分支: 游戏进程未运行且不在前台 -> 完整重启')
             self.app_restart()

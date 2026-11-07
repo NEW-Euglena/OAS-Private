@@ -43,6 +43,9 @@ from module.cooperation import Cooperation, BATTLE_TASKS, prepare_task_cooperati
 
 _log_switch_lock = threading.Lock()#线程锁
 
+# 桌面登录恢复单独限次，不占用异常重启额度，避免反复掉登录时无限循环。
+DESKTOP_LOGIN_RETRY_LIMIT = 3
+
 # 页面识别连续失败退避参数：统计窗口内失败达到阈值后，进入递增时长的安静等待
 PAGE_UNKNOWN_FAIL_WINDOW = timedelta(minutes=30)
 PAGE_UNKNOWN_FAIL_LIMIT = 3
@@ -64,6 +67,10 @@ class Script:
         # Failure count of tasks
         # Key: str, task name, value: int, failure count
         self.failure_record = {}
+        self._error_restart_count = 0
+        self._error_restart_pending = False
+        self._desktop_login_count = 0
+        self._login_retry_pending = False
         self.last_task_runtime_outcome: dict[str, Any] | None = None
         self.task_hoarding_until: datetime | None = None
         self.task_hoarding_released = False
@@ -454,6 +461,9 @@ class Script:
         :return:
         """
         while True:
+            # 空闲等待中也可能排队恢复，必须先执行恢复再继续原调度。
+            if self._error_restart_pending:
+                return 'Restart'
             cooperation = self.__dict__.get('_cooperation')
             wake_task = cooperation.wake_next(self.config) if cooperation is not None else None
             task = self.config.get_next()
@@ -508,8 +518,14 @@ class Script:
 
     def _reset_task_runtime_outcome(self) -> None:
         self.last_task_runtime_outcome = None
+        self._login_retry_pending = False
         if 'config' in self.__dict__:
             self.config.task_runtime_outcome = None
+
+    @property
+    def recovery_pending(self) -> bool:
+        """是否存在排队中的异常重启或登录后原任务重试。"""
+        return self._error_restart_pending or self._login_retry_pending
 
     def _set_task_runtime_outcome(self, task: str, status: str, wait_until: datetime | None = None) -> None:
         outcome = {
@@ -685,9 +701,9 @@ class Script:
                 if not self.config.pending_task and not self.config.waiting_task:
                     logger.info('[脚本] 没有已启用的任务，调度器正常结束')
                     break
-                task = self.get_next_task()
+                task = 'Restart' if self._error_restart_pending else self.get_next_task()
                 # Skip first restart
-                if self.is_first_task and task == 'Restart':
+                if self.is_first_task and task == 'Restart' and not self._error_restart_pending:
                     logger.info('[脚本] 调度启动时跳过任务 `Restart`')
                     self.config.task_delay(task='Restart', success=True, server=True)
                     del_cached_property(self, 'config')
@@ -708,18 +724,6 @@ class Script:
                 del_cached_property(self, 'config')
                 continue
 
-            # 桌面模式：客户端刚被自动拉起时停在登录页（_desktop_login_done=False），
-            # 此时 app_is_running() 返回 False。若下一个任务是 gameplay，先强制走 Restart
-            # 登录流程把游戏带到庭院主界面，避免 gameplay 在登录页盲点后被迫重启。
-            # 注意：不能只靠 task_call('Restart') 排队，因为 get_next_task 按 next_run 取最早
-            # 到期的任务，Exploration 等的 next_run 是 2023 永远更优先，Restart 永远排不上去，
-            # 所以这里直接把 task 改写成 Restart 并落进下方 Run 分支执行。
-            if task != 'Restart' and getattr(self.device, 'is_desktop', False) \
-                    and not self.device.app_is_running():
-                logger.info('[设备-桌面] 桌面客户端未登录，先改写为 Restart 执行登录')
-                task = 'Restart'
-                self.is_first_task = False
-
             # Run
             logger.info(f'[脚本] 调度: 开始任务 `{task}`')
             self.device.stuck_record_clear()
@@ -738,6 +742,8 @@ class Script:
                 logger.info('[脚本] 收到调度停止请求，结束调度循环')
                 break
             self.is_first_task = False
+            if task == 'Restart' and success:
+                self._error_restart_pending = False
             self.anti_ban_guard.record_active((datetime.now() - _task_start).total_seconds())
 
             # Check failures
@@ -746,17 +752,17 @@ class Script:
             failed = 0 if success else failed + 1
             # deep_set(self.failure_record, keys=task, value=failed)
             self.failure_record[task] = failed
-            if failed >= 3:
-                logger.critical(f"[脚本] 任务 `{task}` 失败 3 次或以上")
+            if failed > self.config.model.restart.restart_config.error_restart_limit:
+                logger.critical(f"[脚本] 任务 `{task}` 恢复后再次失败")
                 logger.critical("[脚本] 可能原因一: 未正确使用该任务，"
                                 "请阅读选项的帮助文本")
                 logger.critical("[脚本] 可能原因二: 该任务本身可能存在问题，"
                                 "请联系开发者或自行尝试修复")
                 logger.critical('[脚本] 请求人工接管')
-                # 添加失败三次的推送通知
+                # 恢复后再次失败时停止脚本。
                 self.config.notifier.push(
                     title=f'{I18n.trans_zh_cn(task)}{task}',
-                    content=f"<{self.config_name}> 任务连续失败三次，请上线查看"
+                    content=f"<{self.config_name}> 任务恢复后再次失败，脚本已停止，请上线查看"
                 )
                 # 关闭模拟器
                 if self.config.script.error.error_repeated:
@@ -777,6 +783,70 @@ class Script:
 
         self._cooperation.close()
 
+    def _ensure_restart_enabled(self) -> None:
+        """异常重启尊重重启任务的启用开关。"""
+        if self.config.model.restart.scheduler.enable:
+            return
+        self._error_restart_pending = False
+        logger.critical('[脚本] 重启任务未启用，停止脚本，请手动处理')
+        self.config.notifier.push(
+            title='Restart',
+            content=f'<{self.config_name}> 重启任务未启用，无法自动恢复，脚本已停止，请手动处理',
+        )
+        raise SystemExit(1)
+
+    def _request_error_restart(self, command: str) -> None:
+        """按本次脚本运行的累计额度安排异常重启，并优先调度。"""
+        self._ensure_restart_enabled()
+        limit = self.config.model.restart.restart_config.error_restart_limit
+        if self._error_restart_count >= limit:
+            logger.critical(f'[脚本] 异常重启次数已达上限 {limit} 次，停止脚本，请手动处理')
+            self.config.notifier.push(
+                title=f'{I18n.trans_zh_cn(command)}{command}',
+                content=f'<{self.config_name}> 异常重启次数已达上限 {limit} 次，脚本已停止，请上线查看',
+            )
+            raise SystemExit(1)
+        self._error_restart_count += 1
+        logger.warning(f'[脚本] 异常恢复重启 {self._error_restart_count}/{limit}: {command}')
+        self._error_restart_pending = True
+        self.config.task_call('Restart', force_call=False)
+
+    def desktop_login_recovery(self, command: str = '') -> bool:
+        """桌面窗口仍在但未登录时直接登录，不消耗异常重启额度。"""
+        if not self.device.is_desktop:
+            return False
+        if not self.device.desktop_window_exists():
+            return False
+        if self.device.app_is_running() and not self.device.find_desktop_login_popup():
+            return False
+        if self._desktop_login_count >= DESKTOP_LOGIN_RETRY_LIMIT:
+            logger.warning(f'[登录] 连续登录恢复已达 {DESKTOP_LOGIN_RETRY_LIMIT} 次，转交重启恢复')
+            return False
+        self._desktop_login_count += 1
+        logger.info(f'[登录] 桌面客户端未登录，直接登录 '
+                    f'{self._desktop_login_count}/{DESKTOP_LOGIN_RETRY_LIMIT}')
+        from tasks.Component.Login.service import LoginService
+        try:
+            LoginService(config=self.config, device=self.device).app_handle_login()
+        except RequestHumanTakeover as e:
+            self._request_human_takeover(e, command)
+        except GameNotRunningError as e:
+            # 登录过程中窗口已关闭，无法继续直接登录，交给重启任务恢复。
+            logger.warning(f'[登录] 登录期间桌面窗口丢失: {e}')
+            return False
+        return True
+
+    def _request_human_takeover(self, e: Exception, command: str) -> None:
+        """记录人工接管原因并通知用户，结束当前脚本。"""
+        logger.critical(e)
+        self.exception_handler(e=e, command=command)
+        logger.critical('[脚本] 请求人工接管')
+        self.config.notifier.push(
+            title=f'{I18n.trans_zh_cn(command)}{command}',
+            content=f'<{self.config_name}> RequestHumanTakeover',
+        )
+        raise SystemExit(1)
+
     def _handle_task_exception(self, e: Exception, command: str) -> bool:
         """
         统一处理任务执行 / 准备阶段抛出的异常。
@@ -789,12 +859,17 @@ class Script:
         """
         if isinstance(e, TaskEnd):
             self._capture_task_runtime_outcome(command)
+            # 原任务正常收尾后，重新给予独立的登录恢复次数。
+            self._desktop_login_count = 0
             return True
 
         if isinstance(e, GameNotRunningError):
             logger.warning(e)
             self.exception_handler(e=e, command=command)
-            self.config.task_call('Restart')
+            if self.desktop_login_recovery(command):
+                self._login_retry_pending = True
+                return True
+            self._request_error_restart(command)
             return True
 
         if isinstance(e, (GameStuckError, GameTooManyClickError)):
@@ -805,7 +880,7 @@ class Script:
             logger.warning('[脚本] 如果正在手动游玩，请先停止 Oas')
             self.config.notifier.push(title=f'{I18n.trans_zh_cn(command)}{command}',
                                       content=f"<{self.config_name}> GameStuckError or GameTooManyClickError")
-            self.config.task_call('Restart')
+            self._request_error_restart(command)
             self.device.sleep(10)
             return False
 
@@ -815,7 +890,7 @@ class Script:
             self.exception_handler(e=e, command=command)
             logger.warning('[脚本] 游戏客户端发生错误，Oas 无法处理')
             logger.warning(f'[脚本] 正在重启 {self.device.package} 以修复')
-            self.config.task_call('Restart')
+            self._request_error_restart(command)
             self.device.sleep(10)
             return False
 
@@ -838,7 +913,7 @@ class Script:
                 title=f'{I18n.trans_zh_cn(command)}{command}',
                 content=f"<{self.config_name}> GamePageUnknownError",
             )
-            self.config.task_call('Restart')
+            self._request_error_restart(command)
             self.device.sleep(10)
             return False
 
@@ -853,14 +928,7 @@ class Script:
             exit(1)
 
         if isinstance(e, RequestHumanTakeover):
-            logger.critical(e)
-            self.exception_handler(e=e, command=command)
-            logger.critical('[脚本] 请求人工接管')
-            self.config.notifier.push(
-                title=f'{I18n.trans_zh_cn(command)}{command}',
-                content=f"<{self.config_name}> RequestHumanTakeover",
-            )
-            exit(1)
+            self._request_human_takeover(e, command)
 
         # generic
         logger.exception(e)

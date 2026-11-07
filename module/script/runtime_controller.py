@@ -20,6 +20,13 @@ class ScriptRuntimeOwner(Protocol):
     last_task_runtime_outcome: dict[str, Any] | None
     __dict__: dict[str, Any]
 
+    @property
+    def recovery_pending(self) -> bool:
+        """是否有待调度的异常重启或登录后重试。"""
+
+    def desktop_login_recovery(self, command: str = '') -> bool:
+        """尝试直接登录仍有窗口的桌面客户端。"""
+
     def wait_until(self, future: datetime) -> bool:
         """
         等待到指定时间，返回等待是否完整结束。
@@ -211,17 +218,21 @@ class ScriptRuntimeController:
 
     def _run_restart_recovery(self, reason: str) -> ScriptRuntimeDecision:
         """
-        通过 `Restart` 任务恢复游戏运行环境。
+        桌面客户端未登录时直接登录，其余情况通过 `Restart` 恢复。
 
         Args:
             reason: 触发恢复的原因说明。
 
         Returns:
             ScriptRuntimeDecision:
+                `READY` 表示已直接登录，当前流程可继续；
                 `RESCHEDULE` 表示恢复成功但需要回到主调度器重新选任务，
                 `FAILED` 表示恢复失败。
         """
         logger.info(reason)
+        if self.script.desktop_login_recovery():
+            logger.info('[脚本控制] 桌面客户端已直接登录，不占用异常重启额度')
+            return ScriptRuntimeDecision.READY
         if not self.script.run('Restart'):
             logger.warning('[脚本控制] 运行时恢复期间 Restart 任务失败')
             return ScriptRuntimeDecision.FAILED
@@ -268,6 +279,10 @@ class ScriptRuntimeController:
         if require_main:
             logger.info('[脚本控制] 等待期间确保游戏停留在主界面')
             if self.script.run('GotoMain'):
+                # 任务返回成功也可能只是排好了恢复，必须让调度器接手。
+                if self.script.recovery_pending:
+                    logger.info('[脚本控制] 返回庭院期间已安排恢复，返回调度器')
+                    return ScriptRuntimeDecision.RESCHEDULE
                 return ScriptRuntimeDecision.READY
             decision = self._consume_server_update_delay_outcome('GotoMain preparation')
             if decision is not None:
