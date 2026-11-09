@@ -16,7 +16,8 @@ from module.device.device import Device
 from tasks.AbyssShadows.assets import AbyssShadowsAssets
 from tasks.AbyssShadows.config import AbyssShadows, EnemyType, AreaType, Code, AbyssShadowsDifficulty, \
     CodeList, IndexMap
-from tasks.AbyssShadows.page import page_abyss, page_abyss_map, page_shikigami_records
+from tasks.AbyssShadows.page import page_abyss, page_shikigami_records
+from tasks.GlobalGame.assets import GlobalGameAssets
 from tasks.Component.GeneralBattle.general_battle import GeneralBattle
 from tasks.Component.SwitchSoul.switch_soul import SwitchSoul
 from tasks.GameUi.game_ui import GameUi
@@ -354,7 +355,11 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
                     continue
 
             # 点击前往按钮,知道该按钮消失或出现"挑战"字样
-
+            # 前往按钮消失 = 前往已生效(角色移动中), 此时不设短超时, 等角色抵达:
+            # 浮层重新打开出现挑战按钮则正常挑战; 只有前往按钮说明目标当前无法挑战
+            # (多半已被其他寮友击杀), 直接跳过, 避免反复白跑直到点击上限报错
+            goto_walked = False
+            timer_walk = Timer(60)
             while 1:
                 self.screenshot()
                 if self.appear(self.I_CHECK_FINISH):
@@ -366,8 +371,19 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
                     self.click(self.I_ENSURE_BUTTON, interval=1)
                     continue
                 if self.appear(self.I_ABYSS_GOTO_ENEMY):
+                    if goto_walked:
+                        logger.info(f"[狭间暗域] {item_code} 抵达后仍无挑战按钮，判定当前无法挑战，跳过")
+                        return False
                     self.click(self.I_ABYSS_GOTO_ENEMY, interval=1)
                     count_click_goto_enemy += 1
+                    continue
+                if count_click_goto_enemy > 0:
+                    # 前往按钮已消失, 角色移动中: 改用长超时等待抵达
+                    if not goto_walked:
+                        goto_walked = True
+                        timer_walk.start()
+                    if timer_walk.reached():
+                        break
                     continue
                 if not self.wait_until_appear(self.I_ABYSS_FIRE, wait_time=10):
                     break
@@ -437,8 +453,17 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
             case AbyssShadowsDifficulty.EXTREME:
                 difficulty_btn = self.I_DIFFICULTY_EXTREME
         self.ui_click_until_disappear(difficulty_btn, interval=2)
-        # 开始
-        self.ui_click(self.I_BTN_START, stop=self.I_START_ENSURE, interval=2)
+        # 开始: 点击开启后弹「是否消耗寮勋章开启」确认弹窗
+        # 弹窗确定按钮有新旧两套 UI（I_ENSURE_BUTTON 新版 / I_START_ENSURE 旧版兜底），
+        # 只认旧版会对着弹窗底下的开启按钮反复点击直到点击上限报错
+        timer_ensure = Timer(15).start()
+        while not timer_ensure.reached():
+            self.screenshot()
+            if self.appear(self.I_ENSURE_BUTTON, interval=2) or self.appear(self.I_START_ENSURE, interval=2):
+                break
+            if self.appear_then_click(self.I_BTN_START, interval=2):
+                continue
+        self.ui_click_until_disappear(self.I_ENSURE_BUTTON, interval=2)
         self.ui_click_until_disappear(self.I_START_ENSURE, interval=2)
 
     def process(self):
@@ -507,11 +532,13 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
                 raise AbyssShadowsFinished
             if self.appear(self.I_ABYSS_MAP):
                 break
-            if self.appear(self.I_ABYSS_NAVIGATION):
-                self.click(self.I_ABYSS_NAVIGATION, interval=1)
-                continue
+            # 敌人信息浮层会压暗地图, 但导航按钮模板仍能穿透命中(实测 1.0 分),
+            # 必须先判浮层并关闭, 否则会反复点击被压住的导航按钮直到点击上限报错
             if self.appear(self.I_ABYSS_FIRE) or self.appear(self.I_ABYSS_GOTO_ENEMY):
                 self.click(self.I_ABYSS_ENEMY_INFO_EXIT, interval=2)
+                continue
+            if self.appear(self.I_ABYSS_NAVIGATION):
+                self.click(self.I_ABYSS_NAVIGATION, interval=1)
                 continue
 
     def execute(self, item_code: Code):
@@ -691,8 +718,10 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
             self.screenshot()
             if self.appear_any_exit_ensure():
                 # 退出确认有两套 UI（旧版「确认」/新版「确定」），哪个出现点哪个
+                # 确认后到回到大地图之间还有结算/胜利画面过渡, 等待过短会对着过渡动画
+                # 重复点退出和确认(实测每场固定 2 次超时), 放宽到 6 秒
                 if self.click_exit_ensure(interval=1):
-                    self.wait_until_appear(self.I_ABYSS_NAVIGATION, wait_time=1)
+                    self.wait_until_appear(self.I_ABYSS_NAVIGATION, wait_time=6)
                 continue
             if self.appear(self.I_ABYSS_NAVIGATION):
                 break
@@ -767,6 +796,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
         self.goto_page(page_shikigami_records)
 
         # 切换御魂
+        switch_failed = False
         try:
             l = preset_key.split(',')
             if len(l) != 2:
@@ -781,11 +811,35 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
 
             logger.info(f"成功在狭间中切换至 {enemy_type.name} 预设 {preset_str}")
         except Exception as e:
+            switch_failed = True
             logger.error(f"御魂切换失败: {e}")
             raise RequestHumanTakeover
         finally:
-            # 返回狭间活动页面
-            self.goto_page(page_abyss_map)
+            # 返回狭间地图。式神录返回箭头的落点与进入方式相关(狭间进入回狭间地图,
+            # 庭院进入回庭院), 不能走全局导航(见 page.py 说明), 这里直接点返回箭头
+            logger.info("[狭间暗域] 切换御魂完成，点击返回箭头回狭间地图")
+            timer_back = Timer(15).start()
+            back_ok = False
+            while not timer_back.reached():
+                self.screenshot()
+                if self.appear(self.I_ABYSS_NAVIGATION):
+                    back_ok = True
+                    break
+                if self.appear_then_click(GlobalGameAssets.I_UI_BACK_YELLOW, interval=1):
+                    continue
+            if back_ok:
+                logger.info("[狭间暗域] 已返回狭间地图")
+            elif switch_failed:
+                # 切换已失败在途(RequestHumanTakeover), 不再做位置恢复
+                logger.warning("[狭间暗域] 返回狭间地图超时，切换已失败，跳过位置恢复")
+            else:
+                # 返回箭头未生效(落点异常/弹窗遮挡), 从狭间入口重建位置,
+                # 避免后续 change_area 在非狭间界面上无限空转
+                logger.warning("[狭间暗域] 返回箭头未回到狭间地图，尝试从狭间入口重新进入")
+                self.goto_page(page_abyss)
+                self.start_abyss_shadows()
+                if not self.select_boss(current_area):
+                    logger.warning("[狭间暗域] 从狭间入口重建位置失败，交由后续流程处理")
 
     def check_available(self, item_code: Code):
         # 判断该怪物是否可用
