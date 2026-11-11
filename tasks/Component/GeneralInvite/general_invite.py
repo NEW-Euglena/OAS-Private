@@ -133,8 +133,8 @@ class GeneralInvite(BaseTask, GeneralInviteAssets):
 
             # 点击挑战
             if self.room_check_can_fire(config):
-                self.click_fire()
-                return True
+                if self.click_fire() is not False:
+                    return True
             if self.timer_invite and self.timer_invite.reached():
                 if is_first:
                     logger.info('[通用邀请] 每20秒触发一次邀请')
