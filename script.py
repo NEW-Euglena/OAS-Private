@@ -730,12 +730,14 @@ class Script:
             self.device.click_record_clear()
             logger.hr(task, level=0)
             self.config.model.running_task = task
+            self._cooperation.publish(task)
             _task_start = datetime.now()
             RuleScatter.begin_task(task)
             try:
                 success = self.run(inflection.camelize(task))
             finally:
                 RuleScatter.end_task(task)
+                self._cooperation.publish('')
             self.config.model.running_task = ''
             logger.info(f'[脚本] 调度: 任务 `{task}` 执行结束')
             if getattr(self.config, 'request_scheduler_stop', False):
