@@ -655,6 +655,19 @@ class Script:
             return self._handle_task_exception(e, command)
         return False
 
+    def ensure_cooperation_runtime(self):
+        """config 可能被重建（del_cached_property），每次循环重新挂载协同实例。"""
+        # 必须复用 loop() 中发布任务名的实例：runners 以实例名为主键，
+        # 另起一个实例发心跳会用空任务名覆盖当前任务名，对端会误判本端已离开任务。
+        runtime = self.__dict__.get('_cooperation')
+        if runtime is None:
+            from module.cooperation import Cooperation
+            runtime = Cooperation(self.config_name)
+            runtime.start()
+            self._cooperation = runtime
+        self.config.cooperation_runtime = runtime
+        return runtime
+
     def loop(self):
         """
         Main loop of scheduler.
@@ -696,7 +709,7 @@ class Script:
             task = ""
             try:
                 # config 可能被重建，每次循环重新挂载现有协同实例。
-                self.config.cooperation_runtime = self._cooperation
+                self.ensure_cooperation_runtime()
                 # Get task
                 self.config.reload()
                 self.config.update_scheduler()
