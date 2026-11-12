@@ -7,7 +7,7 @@ from tasks.Component.GeneralBattle.assets import GeneralBattleAssets
 from tasks.EvoZone.config import EvoZone, EvoZoneConfig, UserStatus as AwakeUserStatus
 from tasks.EvoZone.script_task import ScriptTask as AwakeTask
 from tasks.Exploration.config import (
-    AutoRotate, Exploration, ExplorationConfig, ExplorationLevel,
+    AutoRotate, Exploration, ExplorationConfig,
     UpType, UserStatus as ExplorationUserStatus,
 )
 from tasks.Exploration.script_task import ScriptTask as ExplorationTask
@@ -27,7 +27,7 @@ class TicketPartnerFinished(Exception):
 
 
 def metademon_tickets_full(task) -> bool:
-    """读取当前奖励截图的门票/上限；无有效上限时不判满。"""
+    """读取当前奖励截图的门票/上限；无有效上限或读数越界时不判满。"""
     # I_REWARD is the red-daruma settlement image; I_UI_REWARD is the
     # separate "获得奖励" banner and does not identify this battle reward screen.
     if not task.appear(GeneralBattleAssets.I_REWARD):
@@ -35,6 +35,10 @@ def metademon_tickets_full(task) -> bool:
     current, remaining, total = GeneralBattleAssets.O_METADEMON_PASS.ocr_digit_counter(task.device.image)
     if total <= 0 or current < 0:
         logger.warning('超鬼王门票 OCR 未识别到有效计数')
+        return False
+    if current > total:
+        # 门票数量不可能超过上限，越界一定是识别错误；此时不能按“已满”结束任务。
+        logger.warning(f'超鬼王门票 OCR 计数越界({current}/{total})，按识别错误忽略本次读数')
         return False
     logger.info(f'超鬼王门票: {current}/{total}')
     return current >= total
@@ -130,7 +134,7 @@ def ticket_farming_config(meta, mode):
             battle = battle.model_copy(update={'lock_team_enable': False})
         return Exploration(
             exploration_config=ExplorationConfig(user_status=ExplorationUserStatus(common.user_status.value),
-                exploration_level=ExplorationLevel.EXPLORATION_28,
+                exploration_level=common.exploration_level,
                 limit_time=common.limit_time, minions_cnt=2 ** 31 - 1,
                 auto_rotate=AutoRotate.yes if common.exploration_rotate else AutoRotate.no,
                 up_type=target[common.exploration_target]),
@@ -146,6 +150,10 @@ def tickets_full_before_farming(owner) -> bool:
         if not owner.appear(GameUiAssets.I_CHECK_EXPLORATION):
             continue
         current, _, total = MetaDemonAssets.O_METADEMON_PASS_EXP.ocr_digit_counter(owner.device.image)
+        if current > total >= 0:
+            # 越界读数按识别错误重试，避免把错误的数字当成已满。
+            logger.warning(f'门票刷取前检测计数越界({current}/{total})，重试识别')
+            continue
         if current >= 0 and total > 0:
             logger.info(f'门票刷取前检测: {current}/{total}')
             return current >= total

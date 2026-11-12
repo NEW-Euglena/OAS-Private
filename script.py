@@ -695,6 +695,8 @@ class Script:
 
             task = ""
             try:
+                # config 可能被重建，每次循环重新挂载现有协同实例。
+                self.config.cooperation_runtime = self._cooperation
                 # Get task
                 self.config.reload()
                 self.config.update_scheduler()
@@ -730,14 +732,18 @@ class Script:
             self.device.click_record_clear()
             logger.hr(task, level=0)
             self.config.model.running_task = task
-            self._cooperation.publish(task)
             _task_start = datetime.now()
+            # 发布当前任务名供对端判断本实例是否在协同任务中。
+            cooperation = self.__dict__.get('_cooperation')
+            if cooperation is not None:
+                cooperation.publish(task)
             RuleScatter.begin_task(task)
             try:
                 success = self.run(inflection.camelize(task))
             finally:
                 RuleScatter.end_task(task)
-                self._cooperation.publish('')
+                if cooperation is not None:
+                    cooperation.publish('')
             self.config.model.running_task = ''
             logger.info(f'[脚本] 调度: 任务 `{task}` 执行结束')
             if getattr(self.config, 'request_scheduler_stop', False):
