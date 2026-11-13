@@ -991,9 +991,12 @@ class ScriptTask(GameUi, Summon, DailyTriflesAssets):
         self.screenshot()
         self.appear_then_click(self.I_GIFT_RECOMMEND, interval=1)
         logger.info('[每日琐事] 进入商店签到')
-        sleep(1)  # 等个动画
-        self.screenshot()
-        if not self.appear(self.I_GIFT_SIGN):
+        # 页签切换动画偶发超过 1 秒（活动期间更明显），固定短等待会误报未找到；改有界等待并在超时后重试点击页签（命中即提前返回，最长约 6 秒）
+        for _ in range(2):
+            if self.wait_until_appear(self.I_GIFT_SIGN, wait_time=3):
+                break
+            self.appear_then_click(self.I_GIFT_RECOMMEND, interval=1)
+        else:
             logger.warning('[每日琐事] 未找到礼包签到')
             return
 
