@@ -11,13 +11,15 @@ from unittest.mock import Mock, call, patch
 
 import numpy as np
 
+from module.config.config_model import ConfigModel
 from module.cooperation import Cooperation, prepare_task_cooperation
-from module.exception import TaskEnd
+from module.exception import ScriptError, TaskEnd
 from module.image import rpc as image_rpc
 from module.image.rpc import ImageClient
 from module.image.runtime import ImageRuntime, ImageServerSettings
 from tasks.MetaDemon.boss_battle import BossBattle
-from tasks.MetaDemon.config import AssistanceRole, MetaDemonMode
+from tasks.MetaDemon.config import (
+    AssistanceRole, BossType, MetaDemon, MetaDemonMode, OfferingMode, OfferingOrder, OfferingStar)
 import tasks.MetaDemon.assistance as assistance
 import tasks.MetaDemon.page as ipages
 
@@ -107,6 +109,29 @@ class CooperationHeartbeatChecks(unittest.TestCase):
             self.assertTrue(a.prepare(config, 'MetaDemon', 'assist', defer=False))
         self.assertEqual(sleep.call_args_list, [call(5)] * 6)
 
+    def test_independent_offer_cannot_be_used_as_a_cooperative_partner(self):
+        path = self.root / 'config' / 'offer.json'
+        data = json.loads(path.read_text(encoding='utf-8'))
+        data['meta_demon']['assistance_config']['offering_mode'] = OfferingMode.INDEPENDENT.value
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        with self.assertRaisesRegex(ScriptError, '不协同'):
+            self.runtime('assist').validate('MetaDemon', 'offer')
+
+    def test_running_assistant_detects_offer_switching_to_independent_mode(self):
+        offer = self.runtime('offer')
+        offer.publish('MetaDemon')
+        task = SimpleNamespace(
+            conf=MetaDemon(assistance_config={'role': '协助', 'cooperation_script': 'offer'}),
+            config=SimpleNamespace(config_name='assist', cooperation_runtime=self.runtime('assist')),
+        )
+        link = assistance.AssistanceLink(task)
+        self.assertTrue(link.peer_in_task())
+        path = self.root / 'config' / 'offer.json'
+        data = json.loads(path.read_text(encoding='utf-8'))
+        data['meta_demon']['assistance_config']['offering_mode'] = OfferingMode.INDEPENDENT.value
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        self.assertFalse(link.peer_in_task())
+
 
 class SingleCooperationRuntimeChecks(unittest.TestCase):
     """调度循环只能有一个协同实例，否则心跳会把已发布的任务名清空。"""
@@ -156,7 +181,7 @@ class MetaDemonModeGateChecks(unittest.TestCase):
     def config(self, mode, *, reload=None, task_call=None):
         model = SimpleNamespace(meta_demon=SimpleNamespace(
             meta_demon_config=SimpleNamespace(mode=[mode]),
-            assistance_config=SimpleNamespace(cooperation_script='assist'),
+            assistance_config=SimpleNamespace(cooperation_script='assist', requires_cooperation=True),
             scheduler=SimpleNamespace(enable=True),
         ))
         config = SimpleNamespace(model=model, config_name='offer',
@@ -327,6 +352,53 @@ class ImageFrameFallbackChecks(unittest.TestCase):
         self.expire(frame_id)
         np.testing.assert_array_equal(self.runtime._resolve_image(frame_id, payload), image)
         self.assertEqual(self.runtime._cache_stats['frame_fallbacks'], 1)
+
+
+class OfferingOrderChecks(unittest.TestCase):
+    """上供召唤顺序：老配置默认低星优先，配置往返后按序传入召唤流程。"""
+
+    cases = ((OfferingStar.FOUR_PLUS, (4, 5, 6)),
+             (OfferingStar.FIVE_PLUS, (5, 6)),
+             (OfferingStar.SIX, (6,)))
+
+    def test_existing_offering_configs_default_to_low_star_first(self):
+        for star, sequence in self.cases:
+            with self.subTest(star=star):
+                conf = MetaDemon(assistance_config={'offering_star': star.value})
+                self.assertEqual(conf.assistance_config.offering_order, OfferingOrder.ASCENDING)
+                self.assertEqual(tuple(map(int, conf.assistance_config.offering_sequence)), sequence)
+
+    def test_offering_order_round_trips_and_reaches_summoning(self):
+        for star, ascending in self.cases:
+            for order in OfferingOrder:
+                with self.subTest(star=star, order=order):
+                    conf = MetaDemon(assistance_config={
+                        'offering_star': star.value, 'offering_order': order.value})
+                    conf = MetaDemon.model_validate_json(conf.model_dump_json())
+                    expected = ascending if order == OfferingOrder.ASCENDING else ascending[::-1]
+                    sequence = tuple(BossType(value) for value in expected)
+                    self.assertEqual(conf.assistance_config.offering_sequence, sequence)
+                    owner = object.__new__(BossBattle)
+                    owner.conf = conf
+                    owner.start_time = datetime.now()
+                    owner.limit_time = timedelta(minutes=5)
+                    owner.limit_count = 10
+                    owner.total_count = 0
+                    owner.State = SimpleNamespace(done=False)
+                    owner.appear = Mock(side_effect=lambda rule: rule is owner.I_MD_SUMMON_BOSS)
+                    owner.check_and_switch_ticket = Mock(return_value=True)
+                    offering = assistance.GhostOffering(owner, Mock())
+                    self.assertTrue(offering.tick())
+                    self.assertTrue(offering.tick())
+                    owner.check_and_switch_ticket.assert_called_once_with(sequence=sequence)
+
+    def test_offering_order_is_exposed_in_settings(self):
+        payload = ConfigModel.script_task(SimpleNamespace(meta_demon=MetaDemon()), 'MetaDemon')
+        fields = {field['name']: field for field in payload['assistance_config']}
+        self.assertEqual(fields['offering_order']['enumEnum'], ['顺序', '倒序'])
+        self.assertEqual(fields['offering_order']['default'], '顺序')
+        section = next(s for s in MetaDemon.settings_layout if s['id'] == 'assistance_config')
+        self.assertIn('offering_order', section['groups'][0]['fields'])
 
 
 if __name__ == '__main__':
