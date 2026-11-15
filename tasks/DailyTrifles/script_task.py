@@ -989,13 +989,31 @@ class ScriptTask(GameUi, Summon, DailyTriflesAssets):
         self.config.daily_trifles.done_record.store_sign_dt = datetime.now()
         self.goto_page(page_store_gift_room)
         self.screenshot()
-        self.appear_then_click(self.I_GIFT_RECOMMEND, interval=1)
+        # 礼包屋会保留上次停留的页签，活动期默认停在活动页；签到入口只在「日常」选中时出现
+        if not self.appear(self.I_GIFT_DAILY_SELECTED):
+            # 活动与新手页签叠加会把「日常」挤到右侧栏底部、下半截被店铺栏遮住，
+            # 完整「日常」文字模板失配；向上滑动页签栏让它恢复完整可见后再重试，最多两遍
+            for attempt in range(3):
+                self.screenshot()
+                if self.appear_then_click(self.I_GIFT_RECOMMEND):
+                    break
+                if attempt < 2:
+                    logger.info('[每日琐事] 日常页签不可见，向上滑动页签栏')
+                    # 右侧页签栏可滚动区域 (1156,69,103,525)，手势起终点都收在区域内，
+                    # 每次上移 180px，滑完重新截图判定，命中即停
+                    self.device.swipe(p1=(1207, 540), p2=(1207, 360),
+                                      control_name='STORE_GIFT_TAB_SCROLL_UP')
+                    sleep(1)
         logger.info('[每日琐事] 进入商店签到')
-        # 页签切换动画偶发超过 1 秒（活动期间更明显），固定短等待会误报未找到；改有界等待并在超时后重试点击页签（命中即提前返回，最长约 6 秒）
-        for _ in range(2):
+        # 确认日常页签选中后等待签到按钮，首次超时则重试点击页签
+        for attempt in range(2):
+            if attempt == 1:
+                self.appear_then_click(self.I_GIFT_RECOMMEND, interval=1)
+            if not self.wait_until_appear(self.I_GIFT_DAILY_SELECTED, wait_time=3):
+                logger.warning('[每日琐事] 未切换到日常页')
+                return
             if self.wait_until_appear(self.I_GIFT_SIGN, wait_time=3):
                 break
-            self.appear_then_click(self.I_GIFT_RECOMMEND, interval=1)
         else:
             logger.warning('[每日琐事] 未找到礼包签到')
             return
