@@ -606,6 +606,11 @@ class ImageRuntime:
         active_threshold = float(rule_data.get("threshold", 0.0) if threshold is None else threshold)
         roi_front = [int(v) for v in rule_data.get("roi_front", [0, 0, 0, 0])]
         roi_back = [int(v) for v in (roi if roi is not None else rule_data.get("roi_back", [0, 0, 0, 0]))]
+        roi_pad = max(0, int(rule_data.get("roi_pad", 0) or 0))
+        if roi_pad:
+            x, y, w, h = roi_back
+            x0, y0 = max(0, x - roi_pad), max(0, y - roi_pad)
+            roi_back = [x0, y0, x + w + roi_pad - x0, y + h + roi_pad - y0]
         scale_range = rule_data.get("scale_range")
         if scale_range is not None:
             scale_range = tuple(float(v) for v in scale_range)

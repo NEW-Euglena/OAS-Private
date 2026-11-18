@@ -297,6 +297,7 @@ class RuleImage:
             "threshold": float(self.threshold),
             "roi_front": list(self.roi_front),
             "roi_back": list(self.roi_back),
+            "roi_pad": ROI_MATCH_PAD,
             "scale_range": scale_range,
             "scale_step": float(self.scale_step),
             "grayscale": bool(getattr(self, 'grayscale', False)),
