@@ -16,7 +16,7 @@
 
 PID 生命周期约定：客户端进程 PID 每次重启都会变，因此它**不写配置**，只活在
 运行时（实例 root_handle）；配了档案目录时另在档案内写 oas_instance.json 状态
-文件，供下次启动精确认领（多开必需，枚举无法区分多个同标题窗口的归属）。
+文件，记录 PID 和进程创建时间，供下次启动精确认领对应档案的实例。
 """
 
 import os
@@ -31,6 +31,7 @@ from ctypes import c_long, byref, POINTER, Structure, wintypes
 from contextlib import contextmanager
 from pathlib import Path
 
+import psutil
 from win32api import SendMessage
 from win32process import GetWindowThreadProcessId
 from win32gui import (GetWindowText, EnumWindows, GetWindowRect, IsWindow,
@@ -42,6 +43,7 @@ from win32con import (WM_KEYDOWN, WM_KEYUP, VK_RETURN, GWL_STYLE, GWL_EXSTYLE,
                       SWP_SHOWWINDOW, SW_RESTORE)
 
 from module.base.decorator import del_cached_property
+from module.config.atomicwrites import atomic_write
 from module.exception import EmulatorNotRunningError
 from module.logger import logger
 
@@ -476,29 +478,61 @@ def desktop_instance_state_path(profile):
     return Path(profile) / 'oas_instance.json'
 
 
-def desktop_read_instance_state(profile) -> dict:
-    """读档案状态文件；不存在/损坏/未配档案返回空 dict。"""
-    path = desktop_instance_state_path(profile)
-    if path is None or not path.is_file():
-        return {}
+def _desktop_process_started_at(pid: int) -> float | None:
+    """返回存活进程的创建时间，进程已退出或无法查询时返回 None。"""
     try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
+        process = psutil.Process(pid)
+        return process.create_time() if process.is_running() else None
+    except (psutil.Error, OSError, OverflowError):
+        return None
+
+
+def _desktop_instance_pid(profile, game_path: str) -> int | None:
+    """验证档案记录仍指向原进程，找到时返回 PID。"""
+    path = desktop_instance_state_path(profile)
+    if path is None:
+        return None
+    try:
+        with path.open(encoding='utf-8') as file:
+            state = json.load(file)
+            saved_at = os.fstat(file.fileno()).st_mtime
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
         logger.warning(f'读取桌面实例状态文件失败: {path}: {e}')
-        return {}
+        return None
+
+    pid = state.get('pid') if isinstance(state, dict) else None
+    if type(pid) is not int or pid <= 0:
+        return None
+    started_at = _desktop_process_started_at(pid)
+    if started_at is not None:
+        if 'started_at' in state:
+            if started_at == state['started_at']:
+                return pid
+        elif started_at <= saved_at:
+            # 旧记录只有 PID，进程必须早于该记录并且属于游戏安装目录。
+            root = desktop_install_root(game_path)
+            if root and _desktop_pid_under_root(pid, root):
+                return pid
+    logger.info(f'忽略已失效的桌面实例记录，PID={pid}')
+    return None
 
 
 def desktop_write_instance_state(profile, pid) -> None:
-    """把当前实例 PID 写进档案状态文件（tmp + replace 原子替换，防读写半截）。"""
+    """将 PID 和进程创建时间原子写入档案状态文件。"""
     path = desktop_instance_state_path(profile)
     if path is None:
         return
     try:
+        pid = int(pid)
+        started_at = _desktop_process_started_at(pid)
+        if started_at is None:
+            logger.warning(f'无法获取桌面实例进程创建时间，PID={pid}')
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps({'pid': int(pid)}, ensure_ascii=False), encoding='utf-8')
-        os.replace(tmp, path)
+        with atomic_write(path, overwrite=True, encoding='utf-8') as file:
+            json.dump({'pid': pid, 'started_at': started_at}, file)
     except Exception as e:
         logger.warning(f'写入桌面实例状态文件失败: {path}: {e}')
 
@@ -715,7 +749,7 @@ def desktop_launch_instance(config) -> bool:
 
     在 GUI/主进程里执行（script_set_arg 的副作用），不依赖 worker 的 Device 实例：
     启动、Job 归属、档案状态文件都是模块级能力，worker 下次需要窗口时按状态文件
-    认领。已在运行（状态文件里的 PID 还活着）则跳过，避免多开出一个。
+    认领。核实档案对应的进程仍在运行时跳过启动，避免多开出一个。
     """
     desktop = getattr(config.script, 'desktop', None)
     if desktop is None or not desktop.enable:
@@ -737,9 +771,8 @@ def desktop_launch_instance(config) -> bool:
         except Exception as e:
             logger.error(f'准备多开档案失败，拒绝启动（避免登录到错误账号）: {e}')
             return False
-    state = desktop_read_instance_state(profile)
-    state_pid = state.get('pid')
-    if state_pid and desktop_pid_alive(state_pid):
+    state_pid = _desktop_instance_pid(profile, root)
+    if state_pid is not None:
         logger.info(f'客户端实例已在运行（PID={state_pid}），跳过启动')
         return True
     # 按钮路径不经过 Device.desktop_bind_pid，窗口标题改名在这里补上：
@@ -1254,18 +1287,13 @@ class DesktopWindow:
            宁可重拉一个自己的，也不能控制别人的客户端。
         """
         profile = self.desktop_profile_dir()
-        state = desktop_read_instance_state(profile)
-        state_pid = state.get('pid')
-        if state_pid:
-            if desktop_pid_alive(state_pid):
-                try:
-                    return int(state_pid), find_desktop_window_by_pid(
-                        state_pid, self._desktop_titles())
-                except EmulatorNotRunningError:
-                    # 进程活着、窗口还没就绪：交调用方等，不能重拉（会多开）
-                    return int(state_pid), 0
-            # PID 已死：状态失效，清掉免得下次误判
-            desktop_clear_instance_state(profile)
+        state_pid = _desktop_instance_pid(profile, self.config.script.desktop.game_path)
+        if state_pid is not None:
+            try:
+                return state_pid, find_desktop_window_by_pid(state_pid, self._desktop_titles())
+            except EmulatorNotRunningError:
+                # 原进程仍存活，交调用方等待窗口，避免重复启动。
+                return state_pid, 0
         if profile is not None:
             # 档案模式只认状态文件：枚举分不清多个同标题实例属于哪个账号
             return None, 0
