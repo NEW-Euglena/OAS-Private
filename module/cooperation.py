@@ -273,6 +273,8 @@ class Cooperation:
             item = self.read(path.stem).get(key, {})
             if not item.get('scheduler', {}).get('enable', False):
                 continue
+            if task == 'BondlingFairyland' and role(item) == 'alone':
+                continue
             target = item.get('invite_config', {}).get('cooperation_script', '').strip()
             if target and ((path.stem in pair and (target not in pair or target == path.stem))
                            or (path.stem not in pair and target in pair)):
@@ -294,6 +296,20 @@ class Cooperation:
             if not waiting:
                 db.execute('DELETE FROM assignments WHERE name=? AND task=?', (self.name, task))
                 self.peers.pop(task, None)
+
+    def clear_pairing(self, config, task, peer=None):
+        """清理当前实例在指定任务里的过期配对、等待和唤醒。"""
+        with self.connect() as db:
+            for table, first, second in (('assignments', 'name', 'peer'),
+                                         ('waiting', 'name', 'peer'),
+                                         ('wakes', 'target', 'source')):
+                db.execute(f'DELETE FROM {table} WHERE task=? AND '
+                           f'(({first}=? AND (? IS NULL OR {second}=?)) OR '
+                           f'({second}=? AND (? IS NULL OR {first}=?)))',
+                           (task, self.name, peer, peer, self.name, peer, peer))
+        for peers in (self.peers, getattr(config, '_cooperation_peers', None) or {}):
+            if peer is None or peers.get(task) == peer:
+                peers.pop(task, None)
 
     def requested(self):
         with self.connect() as db:
@@ -319,17 +335,29 @@ class Cooperation:
                 # 协斗显式留空时，不因对方单向填写而被动接入协同。
                 self.ack(task)
                 continue
+            if task == 'BondlingFairyland' and item is not None and (
+                not item.scheduler.enable or item.bondling_config.user_status == 'alone'
+            ):
+                self.clear_pairing(config, task)
+                continue
             # Ignore obsolete requests when either side changed the pairing or disabled it.
-            if not (self.root / 'config' / f'{source}.json').is_file():
-                self.ack(task)
-                continue
-            sender = self.read(source).get(key, {})
+            source_exists = (self.root / 'config' / f'{source}.json').is_file()
+            sender = self.read(source).get(key, {}) if source_exists else {}
             sender_peer = sender.get(settings_group, {}).get('cooperation_script', '').strip()
-            if (item is None or not item.scheduler.enable
+            if (not source_exists or item is None or not item.scheduler.enable
                     or (configured != source and sender_peer != self.name)):
-                self.ack(task)
+                if task == 'BondlingFairyland':
+                    self.clear_pairing(config, task, source)
+                else:
+                    self.ack(task)
                 continue
-            self.validate(task, source)
+            try:
+                self.validate(task, source)
+            except ScriptError:
+                if task != 'BondlingFairyland':
+                    raise
+                self.clear_pairing(config, task, source)
+                continue
             config.reload()
             config.task_call(task, force_call=False)
             peers = getattr(config, '_cooperation_peers', None) or {}
@@ -348,8 +376,16 @@ class Cooperation:
         with self.connect() as db:
             db.execute('DELETE FROM wakes WHERE target=? AND task=?', (self.name, task))
 
-    def prepare(self, config, task, peer, *, defer=True):
-        self.validate(task, peer)
+    def prepare(self, config, task, peer, *, defer=True, inherited=False):
+        try:
+            partner = self.validate(task, peer)
+        except ScriptError:
+            if not inherited:
+                raise
+            partner = {}
+        if inherited and partner.get('invite_config', {}).get('cooperation_script', '').strip() != self.name:
+            self.clear_pairing(config, task, peer)
+            return False
         if task == 'MetaDemon':
             # 两端调度进程启动有先后，先给对端留出上报心跳的窗口，避免开场直接互相放弃。
             deadline = time.monotonic() + 30
@@ -425,7 +461,12 @@ def prepare_task_cooperation(config, task):
         return
     settings_group = 'assistance_config' if task == 'MetaDemon' else 'invite_config'
     runtime = getattr(config, 'cooperation_runtime', None)
+    if task == 'BondlingFairyland' and item.bondling_config.user_status == 'alone':
+        if runtime is not None:
+            runtime.clear_pairing(config, task)
+        return
     peer = getattr(getattr(item, settings_group, None), 'cooperation_script', '')
+    inherited = task == 'BondlingFairyland' and not peer
     if not peer:
         peer = (runtime.peers.get(task, '') if runtime is not None else '')
         peer = peer or (runtime.accepted_peer(task) if runtime is not None else '')
@@ -435,7 +476,10 @@ def prepare_task_cooperation(config, task):
             runtime = Cooperation(config.config_name)
             config.cooperation_runtime = runtime
         runtime.peers[task] = peer
-        runtime.prepare(config, task, peer)
+        if inherited:
+            runtime.prepare(config, task, peer, inherited=True)
+        else:
+            runtime.prepare(config, task, peer)
 
 
 def prepare_battle_cooperation(owner, task):

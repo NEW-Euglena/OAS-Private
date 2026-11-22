@@ -757,6 +757,9 @@ class Script:
                 RuleScatter.end_task(task)
                 if cooperation is not None:
                     cooperation.publish('')
+                    cooperation.finish(task)
+                peers = getattr(self.config, '_cooperation_peers', None) or {}
+                peers.pop(task, None)
             self.config.model.running_task = ''
             logger.info(f'[脚本] 调度: 任务 `{task}` 执行结束')
             if getattr(self.config, 'request_scheduler_stop', False):
