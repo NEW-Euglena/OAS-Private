@@ -18,7 +18,7 @@ from tasks.Component.GeneralBattle.general_battle import BattleAction, BattleCon
 from tasks.Component.GeneralInvite.general_invite import GeneralInvite
 from tasks.Component.GeneralRoom.general_room import GeneralRoom
 from tasks.Component.SwitchSoul.switch_soul import SwitchSoul, switch_parser
-from tasks.GameUi.default_pages import page_battle_result, random_click
+from tasks.GameUi.default_pages import page_battle, page_battle_result, page_reward, random_click
 from tasks.GameUi.game_ui import GameUi
 from tasks.GameUi.matcher import any_of
 from tasks.GameUi.page import page_main, page_bondling_fairyland, page_shikigami_records, page_mall
@@ -37,6 +37,13 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, GeneralBattle, SwitchSoul, 
 
     def _exit_matcher(self) -> ExitMatcher | None:
         return any_of(self.I_BALL_FIRE, self.I_CHECK_BONDLING_FAIRYLAND, self.I_GI_EMOJI_1, self.I_GI_EMOJI_2)
+
+    def _solo_capture_can_exit(self) -> bool:
+        """单刷结契进入战斗或结算后，才用挑战界面的标志判断退出。"""
+        context = self._battle_context
+        return (context is not None
+                and context.last_page in (page_battle, page_battle_result, page_reward)
+                and self._evaluate_exit_matcher(self._exit_matcher()))
 
     def _register_custom_pages(self) -> None:
         page_result = self.navigator.resolve_page(page_battle_result)
@@ -501,7 +508,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, GeneralBattle, SwitchSoul, 
                         #     self.click(random_click(ltrb=(True, False, False, False)), interval=1.2)
                         logger.info('棋盘不足，退出')
                         return False
-                    self.run_general_battle(battle_config)
+                    self.run_general_battle(battle_config, exit_matcher=self._solo_capture_can_exit)
                 case _:
                     if self.run_leader():
                         return success
