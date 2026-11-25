@@ -12,7 +12,7 @@ from deploy.utils import DataProcessInfo
 from module.base.timer import Timer
 from module.device.handle import Handle
 from module.device.platform2.platform_base import PlatformBase
-from module.device.platform2.emulator_windows import EmulatorInstance, EmulatorManager
+from module.device.platform2.emulator_windows import Emulator, EmulatorInstance, EmulatorManager
 from module.logger import logger
 
 from ctypes import wintypes
@@ -256,6 +256,31 @@ class PlatformWindows(PlatformBase, EmulatorManager):
             logger.info(f'[设备-平台] 探测 ADB 设备失败: {e}')
 
         return devices
+
+    def find_emulator_instance(
+            self,
+            serial: str,
+            name: str = None,
+            path: str = None,
+            emulator: str = None,
+    ) -> EmulatorInstance | None:
+        if emulator == 'MuMuPlayer12' and name and path and os.path.isfile(path):
+            installation = Emulator(path)
+            if installation.type == emulator:
+                try:
+                    matches = [
+                        instance for instance in installation.iter_instances()
+                        if instance.serial == serial and instance.name == name
+                    ]
+                except OSError as error:
+                    logger.warning(f'[设备-平台] 读取已配置的 MuMu 实例失败，改用全机扫描: {error}')
+                else:
+                    if len(matches) == 1:
+                        instance = matches[0]
+                        logger.info(f'[设备-平台] 按配置找到模拟器实例: {instance}')
+                        return instance
+
+        return super().find_emulator_instance(serial=serial, name=name, path=path, emulator=emulator)
 
     def refresh_target_instance(self, reason: str = ''):
         instance = self.refresh_emulator_instance(reason=reason)
