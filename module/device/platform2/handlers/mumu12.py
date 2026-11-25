@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 import re
+import time
 import typing as t
 
 from module.device.platform2.handlers.base import EmulatorHandler
@@ -147,7 +148,28 @@ class MuMu12Handler(EmulatorHandler):
         # MuMuManager.exe control -v 1 shutdown
         return f'"{console}" control -v {mumu_id} shutdown'
 
+    def _prepare_non_default_launch(self, instance, platform) -> bool:
+        main = instance.emulator.path
+        if os.path.basename(main).lower() != 'mumunxmain.exe' or not self.get_instance_id(instance):
+            return True
+        if self.query_player_info(instance, platform).get('info_source') != 'local':
+            return True
+
+        # 先启动托盘进程，避免 MuMu 冷启动主程序时顺带打开 0 号实例。
+        logger.info('[模拟器启动] 正在启动 MuMu 托盘进程，等待管理接口就绪')
+        platform.execute(f'"{main}" --start-hidden --from-launcher', show_window=False, cwd=os.path.dirname(main))
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self.query_player_info(instance, platform).get('info_source') == 'rpc':
+                return True
+            time.sleep(0.5)
+
+        logger.error('[模拟器启动] 等待 MuMu 管理接口就绪超时')
+        return False
+
     def start_instance(self, instance, platform, command: str, show_window: bool) -> bool:
+        if not self._prepare_non_default_launch(instance, platform):
+            return False
         # Wait for the manager to acknowledge the request before starting the
         # launch timer or releasing the lifecycle lock. Popen alone only proves
         # that the CLI was created, not that it accepted the launch request.

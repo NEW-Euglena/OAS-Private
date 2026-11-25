@@ -158,7 +158,7 @@ class PlatformWindows(PlatformBase, EmulatorManager):
         return command.replace(r"\\", "/").replace("\\", "/").replace('"', '"')
 
     @classmethod
-    def execute(cls, command, show_window=True):
+    def execute(cls, command, show_window=True, *, cwd=None):
         """
         Args:
             command (str):
@@ -172,7 +172,8 @@ class PlatformWindows(PlatformBase, EmulatorManager):
         return subprocess.Popen(
             command,
             close_fds=True,
-            startupinfo=startupinfo
+            startupinfo=startupinfo,
+            cwd=cwd,
         )
 
     @classmethod
